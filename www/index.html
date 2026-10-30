@@ -1,0 +1,144 @@
+<!DOCTYPE html>
+<html lang="vi">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>Trình chiếu ảnh</title>
+<link rel="icon" type="image/png" href="icons/icon-192.png">
+<link rel="apple-touch-icon" href="icons/icon-180.png">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-title" content="Trình chiếu">
+<meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+<meta name="theme-color" content="#000000">
+<style>
+*{margin:0}
+html,body{height:100%;background:#000;color:#fff;font-family:system-ui,sans-serif;overflow:hidden}
+#img{position:absolute;inset:0;width:100%;height:100%;object-fit:contain}
+#msg{position:absolute;inset:0;display:none;align-items:center;justify-content:center;padding:24px;text-align:center}
+</style>
+</head>
+<body>
+<img id="img" alt="">
+<div id="msg"></div>
+<script>
+// Dán đường dẫn Apps Script (…/exec) vào đây. Nếu để trống, ứng dụng sẽ hỏi một lần rồi nhớ.
+const SCRIPT_URL = 'https://script.google.com/macros/s/AKfycbzx36RQUr0OnEHylVd4OI09Af5Sg_DTeuUQuHVHZmZOUOTfPIcB_0E8PkdCJ8_VGFmK/exec';
+const SECONDS = 25;
+
+const $ = id => document.getElementById(id);
+const store = {
+  get: k => { try { return localStorage.getItem(k) || ''; } catch (e) { return ''; } },
+  set: (k, v) => { try { localStorage.setItem(k, v); } catch (e) {} }
+};
+const say = t => { $('msg').textContent = t; $('msg').style.display = t ? 'flex' : 'none'; };
+const src = p => `https://lh3.googleusercontent.com/d/${p.id}=s3840`;
+const alt = p => `https://drive.google.com/thumbnail?id=${p.id}&sz=s3840`;
+
+// ---- Kho lưu ảnh trên máy (IndexedDB) ----
+const db = new Promise((res, rej) => {
+  const r = indexedDB.open('slides', 1);
+  r.onupgradeneeded = () => r.result.createObjectStore('kv');
+  r.onsuccess = () => res(r.result); r.onerror = () => rej(r.error);
+});
+const kv = (mode, fn) => db.then(d => new Promise((res, rej) => {
+  const t = d.transaction('kv', mode), rq = fn(t.objectStore('kv'));
+  t.oncomplete = () => res(rq && rq.result); t.onerror = () => rej(t.error);
+}));
+const dbGet = k => kv('readonly', s => s.get(k)).catch(() => null);
+const dbPut = (k, v) => kv('readwrite', s => s.put(v, k)).catch(() => {});
+const dbDel = k => kv('readwrite', s => s.delete(k)).catch(() => {});
+const dbKeys = () => kv('readonly', s => s.getAllKeys()).catch(() => []);
+
+// ---- Danh sách ảnh & đồng bộ ----
+let photos = [], idx = 0, syncing = false, fails = 0, curBlobUrl = '';
+
+async function getList() {
+  let url = SCRIPT_URL || store.get('url');
+  if (!url) { url = (prompt('Dán đường dẫn Apps Script (…/exec):') || '').trim(); store.set('url', url); }
+  const j = await (await fetch(url)).json();
+  return j.photos || [];
+}
+async function download(p) {
+  for (const u of [src(p), alt(p)]) {
+    try {
+      const r = await fetch(u);
+      const b = await r.blob();
+      if (r.ok && b.type.startsWith('image/')) return b;
+    } catch (e) {}
+  }
+  throw new Error('fail');
+}
+async function cacheAll(list) {
+  if (syncing) return; syncing = true;
+  try {
+    const have = new Set(await dbKeys());
+    for (const p of list) {
+      if (have.has('img4k:' + p.id)) continue;
+      try { await dbPut('img4k:' + p.id, await download(p)); } catch (e) {}
+    }
+    const keep = new Set(list.map(p => 'img4k:' + p.id));
+    for (const k of have) if (k.startsWith('img') && !keep.has(k)) await dbDel(k);
+  } finally { syncing = false; }
+}
+async function refresh() {          // cập nhật danh sách (cần mạng), tải ảnh mới ở nền
+  let l;
+  try { l = await getList(); } catch (e) { return false; }
+  if (!l.length) return false;
+  photos = l; dbPut('list', l); cacheAll(l);
+  return true;
+}
+
+// ---- Hiển thị (không hiệu ứng) ----
+async function show() {
+  const p = photos[idx];
+  const b = await dbGet('img4k:' + p.id);
+  const url = b ? URL.createObjectURL(b) : src(p);
+  const im = new Image(); im.src = url;
+  let ok = true;
+  try { await im.decode(); }
+  catch (e) {
+    ok = false;
+    if (!b) { try { im.src = alt(p); await im.decode(); ok = true; } catch (e2) {} }
+  }
+  if (ok) {
+    $('img').src = im.src;
+    if (curBlobUrl) URL.revokeObjectURL(curBlobUrl);
+    curBlobUrl = b ? url : '';
+  } else if (b) URL.revokeObjectURL(url);
+  return ok;
+}
+async function loop() {
+  const ok = await show();
+  fails = ok ? 0 : fails + 1;
+  const wait = (ok || fails >= photos.length) ? SECONDS * 1000 : 1000;  // ảnh lỗi: bỏ qua nhanh
+  setTimeout(() => {
+    idx++;
+    if (idx >= photos.length) { idx = 0; refresh(); }
+    loop();
+  }, wait);
+}
+
+(async () => {
+  try { navigator.storage.persist(); } catch (e) {}
+  const cached = await dbGet('list');
+  if (cached && cached.length) { photos = cached; refresh(); }
+  else {
+    say('Đang tải ảnh...');
+    if (!(await refresh())) {
+      say('Cần kết nối mạng ở lần mở đầu tiên để tải ảnh về máy.');
+      addEventListener('online', () => location.reload(), { once: true });
+      return;
+    }
+    say('');
+  }
+  loop();
+  addEventListener('online', refresh);
+  const lock = () => { try { navigator.wakeLock.request('screen'); } catch (e) {} };
+  lock();
+  document.addEventListener('visibilitychange', () => { if (document.visibilityState === 'visible') lock(); });
+})();
+
+</script>
+</body>
+</html>
